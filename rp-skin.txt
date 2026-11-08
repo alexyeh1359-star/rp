@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Claude RP 스킨 (외부 이미지·대사·상태창)
 // @namespace    rp-skin
-// @version      0.3.0
+// @version      0.4.0
 // @description  claude.ai 답변의 [[img:...]] 이미지 코드를 실제 이미지로 띄우고, 내레이션·대사·STATUS를 롤플 스타일로 보여줍니다.
 // @match        https://claude.ai/*
 // @grant        GM_xmlhttpRequest
@@ -77,6 +77,17 @@
     '.rpx-status .rpx-row:last-child{border-bottom:0}',
     '.rpx-hide{display:none !important}',
     '.rpx-imgline{margin:0 !important}',
+    '.rpx-sns{max-width:450px;margin:10px auto;border-radius:12px;overflow:hidden}',
+    '.rpx-sns img.rpx-sns-img{display:block;width:100%;height:auto;min-height:24px;background:rgba(128,128,128,.12)}',
+    '.rpx-sns details{margin:0}',
+    '.rpx-sns summary{display:block;cursor:pointer;list-style:none}',
+    '.rpx-sns summary::-webkit-details-marker{display:none}',
+    '.rpx-sns summary::marker{content:""}',
+    '.rpx-sns details > div{padding:14px;line-height:1.8;overflow-wrap:anywhere;background:#fff;color:#1b1c1f}',
+    '.rpx-sns details > div *{color:#1b1c1f}',
+    '.rpx-sns blockquote{border-left:3px solid #ccc;margin:8px 0;padding:4px 10px}',
+    '.rpx-sns hr{border:0;border-top:1px solid #ddd;margin:10px 0}',
+    '.rpx-sns .rpx-broken{display:block;margin:4px}',
     'body.rpx-off .rpx-status, body.rpx-off .rpx-img{display:none !important}',
     'body.rpx-off .rpx-hide{display:block !important}',
     'body.rpx-off .rpx-narr{font-style:inherit;opacity:1;border:0;padding:0}',
@@ -199,6 +210,66 @@
     });
   }
 
+  // ---------- SNS HTML 렌더링 (허용 태그·속성만 남기는 안전한 렌더) ----------
+  var SNS_TAGS = { DIV: 1, DETAILS: 1, SUMMARY: 1, IMG: 1, P: 1, B: 1, STRONG: 1, SPAN: 1, SMALL: 1,
+                   BLOCKQUOTE: 1, HR: 1, H3: 1, H4: 1, BR: 1, EM: 1, I: 1, UL: 1, OL: 1, LI: 1 };
+  var SNS_DROP = { SCRIPT: 1, STYLE: 1, IFRAME: 1, OBJECT: 1, EMBED: 1, SVG: 1, MATH: 1, LINK: 1,
+                   META: 1, BASE: 1, FORM: 1, INPUT: 1, BUTTON: 1, TEXTAREA: 1, SELECT: 1, VIDEO: 1, AUDIO: 1 };
+
+  function cleanStyle(s) {
+    if (!s) return '';
+    if (/url\s*\(|expression|javascript:|@import|behavior/i.test(s)) return '';
+    return s.replace(/position\s*:\s*(fixed|sticky)/gi, '');
+  }
+
+  function cleanNode(node) {
+    var kids = Array.prototype.slice.call(node.childNodes);
+    kids.forEach(function (k) {
+      if (k.nodeType === 8) { k.remove(); return; }
+      if (k.nodeType !== 1) return;
+      var tag = k.tagName.toUpperCase();
+      if (SNS_DROP[tag]) { k.remove(); return; }
+      if (!SNS_TAGS[tag]) {
+        cleanNode(k);
+        while (k.firstChild) k.parentNode.insertBefore(k.firstChild, k);
+        k.remove();
+        return;
+      }
+      Array.prototype.slice.call(k.attributes).forEach(function (a) {
+        var n = a.name.toLowerCase();
+        if (n === 'style') { var st = cleanStyle(a.value); if (st) k.setAttribute('style', st); else k.removeAttribute('style'); }
+        else if (n === 'alt' || n === 'open') { /* keep */ }
+        else if (n === 'src' && tag === 'IMG') { /* handled below */ }
+        else k.removeAttribute(a.name);
+      });
+      if (tag === 'IMG') {
+        var src = (k.getAttribute('src') || '').trim();
+        k.removeAttribute('src');
+        if (!/^https?:\/\//i.test(src)) { k.remove(); return; }
+        k.className = 'rpx-sns-img';
+        k.setAttribute('data-rpx-src', src);
+        loadInto(k, src);
+      } else {
+        cleanNode(k);
+      }
+    });
+  }
+
+  function renderSns(html) {
+    try {
+      var doc = new DOMParser().parseFromString('<div id="rpx-sns-root">' + html + '</div>', 'text/html');
+      var src = doc.getElementById('rpx-sns-root');
+      if (!src) return null;
+      var wrap = document.createElement('div');
+      wrap.className = 'rpx-sns';
+      // 다른 문서에서 만든 노드를 현재 문서로 가져온 뒤 정리
+      Array.prototype.slice.call(src.childNodes).forEach(function (n) { wrap.appendChild(document.importNode(n, true)); });
+      cleanNode(wrap);
+      diag.sns = (diag.sns || 0) + 1;
+      return wrap;
+    } catch (e) { diag.lastErr = 'SNS: ' + (e && e.message || e); return null; }
+  }
+
   function processElements(root) {
     // 1) Claude가 이미 <img>로 그렸지만 차단된 외부 이미지
     root.querySelectorAll('img:not([data-rpx-src])').forEach(function (img) {
@@ -230,18 +301,29 @@
         p.classList.add('rpx-narr');
       }
     });
-    // 4) STATUS 코드블록
+    // 4) SNS(HTML) / STATUS 코드블록
     root.querySelectorAll('pre:not([data-rpx])').forEach(function (pre) {
       pre.setAttribute('data-rpx', '1');
       var code = pre.querySelector('code') || pre;
       var cls = (code.className || '') + ' ' + (pre.className || '');
       var body = code.textContent || '';
-      if (!/language-status/i.test(cls) && !/🗓|📍/.test(body)) return;
       var box = pre, up = 0;
       while (up < 3 && box.parentElement && box.parentElement !== root &&
              box.parentElement.textContent.length - pre.textContent.length < 40) {
         box = box.parentElement; up++;
       }
+      var isSns = /language-sns/i.test(cls) || (/^\s*sns\s*\n\s*</i.test(body)) ||
+                  (/^\s*<(div|details|img|p)\b/i.test(body) && /<\/?(details|img|div)\b/i.test(body));
+      if (isSns) {
+        var html = body.replace(/^\s*sns\s*\n/i, '');
+        var view = renderSns(html);
+        if (view) {
+          box.parentNode.insertBefore(view, box);
+          box.classList.add('rpx-hide');
+        }
+        return;
+      }
+      if (!/language-status/i.test(cls) && !/🗓|📍/.test(body)) return;
       var panel = document.createElement('div');
       panel.className = 'rpx-status';
       var h = '<div class="rpx-ttl">STATUS</div>';
@@ -304,9 +386,10 @@
   document.body.appendChild(btn);
   function renderMenu() {
     menu.innerHTML =
-      '<b>RP 스킨 v0.3</b><br>' +
+      '<b>RP 스킨 v0.4</b><br>' +
       '답변 영역: ' + diag.containers + '개 (' + diag.sel + ')<br>' +
       '이미지: 발견 ' + diag.found + ' · 성공 ' + diag.ok + ' · 실패 ' + diag.fail + '<br>' +
+      'SNS 화면: ' + (diag.sns || 0) + '개<br>' +
       'blob 차단 후 대체: ' + diag.blobFail + '<br>' +
       (diag.lastErr ? '마지막 오류: ' + diag.lastErr.replace(/</g, '&lt;') + '<br>' : '') +
       '<button id="rpx-toggle">' + (document.body.classList.contains('rpx-off') ? '스킨 켜기' : '스킨 끄기 (원본 보기)') + '</button>' +
